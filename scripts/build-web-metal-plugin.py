@@ -70,6 +70,11 @@ def compile_ios():
     executable = bundle / 'WebMetal'
     run(['xcrun', 'clang++', '-target', 'arm64-apple-ios17.0', '-isysroot', sdk('iphoneos'), *FLAGS, '-bundle',
          *PLUGIN, guest / 'Plugin/WebMetalLayoutTarget.mm', *GENERATED, *FRAMEWORKS, '-o', executable])
+    # The debug symbols stay beside the bundle, out of its signed contents.
+    symbols = out / 'ios/WebMetal.dSYM'
+    shutil.rmtree(symbols, ignore_errors=True)
+    if (bundle / 'WebMetal.dSYM').exists():
+        shutil.move(bundle / 'WebMetal.dSYM', symbols)
     shutil.copyfile(guest / 'Plugin/Info.plist', bundle / 'Info.plist')
     info = plistlib.loads((bundle / 'Info.plist').read_bytes())
     if info['CFBundleExecutable'] != executable.name or info['NSPrincipalClass'] != 'WebMetalDevice':
