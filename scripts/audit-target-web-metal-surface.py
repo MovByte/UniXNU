@@ -64,6 +64,7 @@ args = parser.parse_args()
 
 webmetal = args.webmetal.resolve()
 sys.path.insert(0, str(webmetal / 'wire/tools'))
+sys.dont_write_bytecode = True  # nothing is written into the WebMetal checkout but guest/Generated
 import target_surface  # noqa: E402  (WebMetal's shared-cache and Objective-C metadata reader)
 
 
