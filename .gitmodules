@@ -58,3 +58,9 @@
 [submodule "drivers/QcomBaseband"]
 	path = drivers/QcomBaseband
 	url = https://github.com/UniXNU/QcomBaseband.git
+[submodule "drivers/WebMetal"]
+	path = drivers/WebMetal
+	url = https://github.com/MovByte/WebMetal.git
+[submodule "kits/AirWgsl"]
+	path = kits/AirWgsl
+	url = https://github.com/MovByte/AirWgsl.git
