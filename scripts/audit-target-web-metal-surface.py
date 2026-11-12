@@ -19,7 +19,9 @@ answer or its protocols declare, from the Objective-C metadata of the target's d
                              class stands in for (guest/Plugin/roles.toml), and the layout of the Metal.framework base
                              classes guest/Private declares: superclass, instance size, instance variables, and every
                              classified selector's presence and type encoding. The plugin refuses to load when the
-                             running Metal.framework differs.
+                             running Metal.framework differs. A driver class whose chain reaches the root class
+                             without a Metal.framework base (AGXTextureLayout -> IOGPUMetalTextureLayout -> NSObject)
+                             has NSObject as its base, which has no layout to guard.
   WebMetalProfileGetters.mm  the capability getters of the A10X: every driver selector the device profile
                              (profile/ipados-17.7.11-21H461-a10x.toml) answers with a value.
   surface.tsv                the classification of every selector of every driver class, with its status in the built
@@ -46,6 +48,8 @@ PROFILE = 'profile/ipados-17.7.11-21H461-a10x.toml'
 GENERATED = 'guest/Generated'
 ROLES = 'guest/Plugin/roles.toml'
 PRIVATE = 'guest/Private/MetalPrivate.h'
+# The root class: the base of a driver class with no Metal.framework class in its chain.
+ROOT_CLASS = 'NSObject'
 DRIVER_IMAGES = ('AGX', 'IOGPU')
 # Runtime-generated and lifecycle selectors: every class has its own, they are no part of the Metal surface.
 LIFECYCLE = {'.cxx_construct', '.cxx_destruct', 'dealloc', 'init', 'initialize', 'load'}
@@ -741,11 +745,12 @@ def main():
         if target.classes[name]['super'] != superclass:
             fail(f'{PRIVATE}: {name} is declared a {superclass}, on 21H461 it is a {target.classes[name]["super"]}')
     for role in mapped:
-        if role['base'] not in declared:
+        if role['base'] not in declared and role['base'] != ROOT_CLASS:
             fail(f'{PRIVATE} does not declare {role["base"]}, the base of {role["name"]}')
     selectors = {name: set() for name in declared}
     for role in mapped:
-        selectors[role['base']] |= set(role['rows'])
+        if role['base'] in selectors:
+            selectors[role['base']] |= set(role['rows'])
     bases = [target.base_layout(name, selectors[name]) for name in sorted(declared)]
     profile_text = (webmetal / PROFILE).read_text()
     device = by_name[PROFILED_CLASS]
