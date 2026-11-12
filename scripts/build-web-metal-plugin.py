@@ -8,8 +8,10 @@ Outputs, under --out (default build/web-metal-plugin):
                                for the WebMetal accelerator service
   macos/libWebMetalHostShim.dylib
                                the macOS test shim: the same classes, built against this Mac's Metal.framework layouts
-                               (recorded by host/WebMetalLayoutProbe.mm), registering a device with MTLAddDevice; it is
-                               also a provider for the reference harness (tests/reference, --device provider:PATH)
+                               (recorded by host/WebMetalLayoutProbe.mm), registering a device with MTLAddDevice and
+                               running the host executor in its own process (host/executor, built with cargo over the
+                               native WebGPU implementation --webgpu-native names); it is also a provider for the
+                               reference harness (tests/reference, --device provider:PATH)
   macos/libWebMetalHostShim-21H461.dylib
                                the shim built with the 21H461 layouts the iOS bundle requires, to show that the guard
                                refuses this Mac's Metal.framework
@@ -24,6 +26,7 @@ it on the shim's device. The plugin's surface against the target is audited by a
 """
 import argparse
 import json
+import os
 import plistlib
 import re
 import shutil
@@ -42,6 +45,10 @@ parser.add_argument('--webmetal', type=Path, default=ROOT / 'drivers/WebMetal', 
 parser.add_argument('--out', type=Path, default=ROOT / 'build/web-metal-plugin', help='output directory')
 parser.add_argument('--no-check', action='store_true', help='build only')
 parser.add_argument('--reference', action='store_true', help='also run the reference harness on the shim device')
+parser.add_argument('--webgpu-native', default=os.environ.get('WEBGPU_NATIVE'),
+                    help="the shim executor's WebGPU implementation: dawn or wgpu-native (default: $WEBGPU_NATIVE)")
+parser.add_argument('--webgpu-native-dir', type=Path, default=os.environ.get('WEBGPU_NATIVE_DIR'),
+                    help='its install root, with include/webgpu/webgpu.h and lib/ (default: $WEBGPU_NATIVE_DIR)')
 args = parser.parse_args()
 
 webmetal = args.webmetal.resolve()
@@ -49,9 +56,12 @@ guest = webmetal / 'guest'
 out = args.out.resolve()
 FLAGS = ['-std=c++17', '-fobjc-arc', '-fobjc-arc-exceptions', '-O2', '-g', '-Wall', '-Wextra', '-Werror',
          '-Wno-unused-parameter']
-PLUGIN = sorted(p for p in (guest / 'Plugin').glob('*.mm') if p.name != 'WebMetalLayoutTarget.mm')
+# Every package's sources under guest/, without the generated ones (listed below), the layouts the iOS bundle alone
+# links, and the macOS test vehicles under host/.
+PLUGIN = sorted(p for p in guest.rglob('*.mm') if p.parent.name not in ('Generated', 'Private') and
+                'host' not in p.relative_to(guest).parts and p.name != 'WebMetalLayoutTarget.mm')
 GENERATED = [guest / 'Generated/WebMetalProfileGetters.mm']
-FRAMEWORKS = ['-framework', 'Foundation', '-framework', 'Metal', '-framework', 'IOKit']
+FRAMEWORKS = ['-framework', 'Foundation', '-framework', 'Metal', '-framework', 'IOKit', '-framework', 'IOSurface']
 
 
 def run(command, **kwargs):
@@ -103,14 +113,34 @@ def compile_macos():
     layout = macos / 'WebMetalLayoutHost.mm'
     run([probe, layout])
     shim = guest / 'Plugin/host/WebMetalHostShim.mm'
+    executor = build_executor()
     for name, layouts in (('libWebMetalHostShim.dylib', layout),
                           ('libWebMetalHostShim-21H461.dylib', guest / 'Plugin/WebMetalLayoutTarget.mm')):
-        run([*host, '-dynamiclib', '-I', guest / 'Plugin', *PLUGIN, layouts, *GENERATED, shim, *FRAMEWORKS,
+        run([*host, '-dynamiclib', '-I', guest / 'Plugin', *PLUGIN, layouts, *GENERATED, shim, *executor, *FRAMEWORKS,
              '-install_name', '@rpath/' + name, '-o', macos / name])
     run([*host, guest / 'Plugin/host/WebMetalHostCheck.mm', '-framework', 'Foundation', '-framework', 'Metal',
          '-o', macos / 'WebMetalHostCheck'])
     (macos / 'expectations.json').write_text(json.dumps(expectations(), indent=1) + '\n')
     print(f'built {macos}')
+
+
+def build_executor():
+    """The shim's host executor (guest/Plugin/host/executor), a static library, and what linking it needs."""
+    if args.webgpu_native not in ('dawn', 'wgpu-native') or not args.webgpu_native_dir:
+        sys.exit('FAIL: the shim runs the host executor: give --webgpu-native dawn|wgpu-native and --webgpu-native-dir')
+    root = args.webgpu_native_dir.resolve()
+    target = out / 'cargo'
+    env = dict(os.environ, WEBGPU_NATIVE=args.webgpu_native, WEBGPU_NATIVE_DIR=str(root), CARGO_TARGET_DIR=str(target))
+    run(['cargo', 'build', '--release', '--locked', '--manifest-path', guest / 'Plugin/host/executor/Cargo.toml'],
+        env=env)
+    link = [target / 'release/libwebmetal_shim_executor.a', '-lc++']
+    if args.webgpu_native == 'dawn':
+        # rustc bundles Dawn's static library into the executor's; the frameworks are those of Dawn's exported CMake
+        # target (host/build.rs).
+        link += ['-framework', 'CoreFoundation', '-framework', 'QuartzCore', '-framework', 'Cocoa']
+    else:
+        link += ['-L', root / 'lib', '-lwgpu_native', '-Wl,-rpath,' + str(root / 'lib')]
+    return link
 
 
 def expectations():
