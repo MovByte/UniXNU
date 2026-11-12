@@ -191,7 +191,7 @@ def check():
         run([tool, 'register', shim, macos / 'expectations.json', hex(sentinel)])
     strict = subprocess.run([tool, 'strict', shim], capture_output=True, text=True,
                             env={'WEBMETAL_STRICT': '1', 'PATH': '/usr/bin:/bin'})
-    line = 'WebMetal: -[WebMetalDevice newCommandQueue]: not implemented'
+    line = 'WebMetal: -[WebMetalDevice newAccelerationStructureWithSize:]: not implemented'
     if strict.returncode != -signal.SIGABRT or line not in strict.stderr or 'WEBMETAL_STRICT' not in strict.stderr:
         sys.exit(f'FAIL: strict mode did not abort at the first LOUD stub (status {strict.returncode}):\n{strict.stdout}{strict.stderr}')
     print(f'PASS: under WEBMETAL_STRICT=1 the first LOUD stub reports and aborts: {line}')
