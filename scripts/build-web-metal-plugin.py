@@ -15,14 +15,15 @@ Outputs, under --out (default build/web-metal-plugin):
   macos/libWebMetalHostShim-21H461.dylib
                                the shim built with the 21H461 layouts the iOS bundle requires, to show that the guard
                                refuses this Mac's Metal.framework
+  macos/WebMetalSPICheck       the checks of the system-client SPI (guest/SPI/host/WebMetalSPICheck.mm) on the shim
   macos/WebMetalHostCheck      the host checks (host/WebMetalHostCheck.mm) and expectations.json, their reading of
                                the device profile
 
 Unless --no-check is given, the checks run: registration and the profile comparison twice, with the two sentinel
 values the device profile's extraction gives the kernel-supplied maxBufferLength; strict mode (WEBMETAL_STRICT=1) at
-the first LOUD stub; and the refusal of the 21H461-layout shim. --reference also builds the reference harness and runs
-it on the shim's device. The plugin's surface against the target is audited by audit-target-web-metal-surface.py
---check --plugin <out>/ios/WebMetal.bundle/WebMetal.
+the first LOUD stub; the refusal of the 21H461-layout shim; and the system-client SPI checks. --reference also builds
+the reference harness and runs it on the shim's device. The plugin's surface against the target is audited by
+audit-target-web-metal-surface.py --check --plugin <out>/ios/WebMetal.bundle/WebMetal.
 """
 import argparse
 import json
@@ -61,7 +62,8 @@ FLAGS = ['-std=c++17', '-fobjc-arc', '-fobjc-arc-exceptions', '-O2', '-g', '-Wal
 PLUGIN = sorted(p for p in guest.rglob('*.mm') if p.parent.name not in ('Generated', 'Private') and
                 'host' not in p.relative_to(guest).parts and p.name != 'WebMetalLayoutTarget.mm')
 GENERATED = [guest / 'Generated/WebMetalProfileGetters.mm']
-FRAMEWORKS = ['-framework', 'Foundation', '-framework', 'Metal', '-framework', 'IOKit', '-framework', 'IOSurface']
+FRAMEWORKS = ['-framework', 'Foundation', '-framework', 'Metal', '-framework', 'IOKit', '-framework', 'IOSurface',
+              '-framework', 'Security']
 
 
 def run(command, **kwargs):
@@ -120,6 +122,9 @@ def compile_macos():
              '-install_name', '@rpath/' + name, '-o', macos / name])
     run([*host, guest / 'Plugin/host/WebMetalHostCheck.mm', '-framework', 'Foundation', '-framework', 'Metal',
          '-o', macos / 'WebMetalHostCheck'])
+    if (guest / 'SPI/host/WebMetalSPICheck.mm').exists():
+        run([*host, guest / 'SPI/host/WebMetalSPICheck.mm', '-framework', 'Foundation', '-framework', 'Metal',
+             '-o', macos / 'WebMetalSPICheck'])
     (macos / 'expectations.json').write_text(json.dumps(expectations(), indent=1) + '\n')
     print(f'built {macos}')
 
@@ -196,6 +201,8 @@ def check():
         sys.exit(f'FAIL: strict mode did not abort at the first LOUD stub (status {strict.returncode}):\n{strict.stdout}{strict.stderr}')
     print(f'PASS: under WEBMETAL_STRICT=1 the first LOUD stub reports and aborts: {line}')
     run([tool, 'refuse', macos / 'libWebMetalHostShim-21H461.dylib'])
+    if (macos / 'WebMetalSPICheck').exists():
+        run([macos / 'WebMetalSPICheck', shim])
 
 
 def reference():
