@@ -747,10 +747,24 @@ class PluginImage:
                 return value
         return None
 
+    def stub_import(self, va):
+        """The imported symbol a __TEXT,__stubs entry (adrp x16; ldr x16, [x16, #slot]; br x16) branches to, or None."""
+        start, size = self.sections.get(('__TEXT', '__stubs'), (0, 0))
+        if not start <= va < start + size:
+            return None
+        adrp, ldr = struct.unpack_from('<II', self.data, self.offset(va))
+        if adrp & 0x9f00001f != 0x90000010 or ldr & 0xffc003ff != 0xf9400210:
+            return None
+        imm = ((adrp >> 29) & 3) | ((adrp >> 5) & 0x7ffff) << 2
+        slot = (va & ~0xfff) + (((imm ^ 0x100000) - 0x100000) << 12) + ((ldr >> 10) & 0xfff) * 8
+        fixup = self.fixups.get(self.offset(slot))
+        return fixup[1] if fixup and fixup[0] == 'bind' else None
+
     def loud_method(self, imp, loud):
-        """Whether the arm64 code at imp calls `loud` (WMLoudMethod, which never returns) before any other call or any
-        branch, so that every call of the method fails; with the detail it passes (x2, built by adrp and add or by adr),
-        or '' when the code computes it otherwise. None for any other method."""
+        """Whether the arm64 code at imp calls `loud` (WMLoudMethod, which never returns) before any branch and any call
+        but ARC's retains of the arguments (objc_retain), so that every call of the method fails; with the detail it
+        passes (x2, built by adrp and add or by adr), or '' when the code computes it otherwise. None for any other
+        method."""
         x2 = None
         for k in range(256):
             pc = imp + 4 * k
@@ -758,6 +772,9 @@ class PluginImage:
             if w & 0xfc000000 == 0x94000000:  # BL
                 target = pc + 4 * (((w & 0x3ffffff) ^ 0x2000000) - 0x2000000)
                 if target != loud:
+                    if (self.stub_import(target) or '').startswith('_objc_retain'):
+                        x2 = None
+                        continue
                     return None
                 try:
                     return self.cstring(x2) if x2 is not None else ''
