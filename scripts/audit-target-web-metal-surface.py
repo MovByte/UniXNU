@@ -13,7 +13,7 @@ answer or its protocols declare, from the Objective-C metadata of the target's d
   absent     a protocol method no class of the chain implements (respondsToSelector: is NO on the device). The plugin
              must not implement it either.
 
---write regenerates guest/Generated in the WebMetal checkout:
+--write regenerates guest/Generated and guest/SPI/clients in the WebMetal checkout:
 
   WebMetalTargetSurface.h    the driver selectors (with type encodings and LOUD reasons) of each driver class a plugin
                              class stands in for (guest/Plugin/roles.toml), and the layout of the Metal.framework base
@@ -27,13 +27,27 @@ answer or its protocols declare, from the Objective-C metadata of the target's d
   surface.tsv                the classification of every selector of every driver class, with its status in the built
                              plugin: implemented, profile or loud for a driver selector of a class the plugin stands in
                              for (no-plugin-class otherwise), inherited for a framework one, not-answered for an absent
-                             one. It needs --plugin, the built iOS executable; the loud rows are the backlog.
+                             one. It needs --plugin, the built iOS executable; the loud rows are the backlog. A
+                             plugin method whose code calls WMLoudMethod before any other call or branch fails every
+                             call: it is loud, not implemented.
+  SPI/clients/<client>.tsv   for each system client guest/SPI/clients.toml names (QuartzCore, CoreImage...), the rows
+                             of surface.tsv whose selector the client's images reference (__objc_selrefs: every
+                             selector they send, test with respondsToSelector: or send to super), with a note for each
+                             loud row (the reason a hand-written LOUD method reports, or guest/SPI/notes.toml's) and
+                             for each row of a driver class no plugin class stands in for (notes.toml's, per class). A
+                             selector reference proves the client can send the message, not to which receiver, so
+                             every driver class with the selector has a row. It needs --plugin.
+
+guest/SPI/notes.toml holds the notes: [loud.<driver class>] gives, for a selector the plugin answers with a generated
+LOUD stub, what is unknown or what the host cannot do exactly (the stub reports it, through WebMetalTargetSurface.h);
+[unserved] gives, for a driver class no plugin class stands in for, why the plugin hands out no object of it.
 
 --check regenerates in memory, fails if a committed file differs, and audits the built plugin: each plugin class has
 the driver class's base and protocols, implements only driver selectors, with the target's type encodings, and every
-other driver selector is a LOUD stub. Categories in the three images join their classes (IOGPU.framework adds one to
-_MTLSharedEvent); categories other images add are not read, and the device profile records that none adds one to the
-device chain.
+other driver selector is a LOUD stub. It fails when a loud or unserved row of a client list has no note, or when
+notes.toml has a note for a selector the plugin implements or for a class a plugin class stands in for. Categories in
+the three images join their classes (IOGPU.framework adds one to _MTLSharedEvent); categories other images add are not
+read, and the device profile records that none adds one to the device chain.
 """
 import argparse
 import re
@@ -48,6 +62,9 @@ PROFILE = 'profile/ipados-17.7.11-21H461-a10x.toml'
 GENERATED = 'guest/Generated'
 ROLES = 'guest/Plugin/roles.toml'
 PRIVATE = 'guest/Private/MetalPrivate.h'
+CLIENTS = 'guest/SPI/clients.toml'
+NOTES = 'guest/SPI/notes.toml'
+CLIENT_LISTS = 'guest/SPI/clients'
 # The root class: the base of a driver class with no Metal.framework class in its chain.
 ROOT_CLASS = 'NSObject'
 DRIVER_IMAGES = ('AGX', 'IOGPU')
@@ -416,7 +433,7 @@ def c_name(name):
     return re.sub(r'\W', '_', name)
 
 
-def surface_header(target, mapped, bases, getters):
+def surface_header(target, mapped, bases, getters, notes):
     out = [HEADER.format(uuid=target.uuid), '#pragma once', '', '#include "../Plugin/WebMetalSurface.h"', '',
            'namespace webmetal::target {', '',
            f'inline constexpr char kCacheUUID[] = {c_string(target.uuid)};', '']
@@ -426,6 +443,7 @@ def surface_header(target, mapped, bases, getters):
         out.append(f'inline constexpr DriverSelector k{c_name(role["name"])}Driver[] = {{')
         for kind, selector, row in rows:
             detail = getters.reasons.get(selector, '') if role['name'] == PROFILED_CLASS and kind == 'instance' else ''
+            detail = '; '.join(d for d in (detail, notes.stub(role['name'], kind, selector)) if d)
             out.append(f'    {{SelectorKind::{kind.capitalize()}, {c_string(selector)}, {c_string(row["types"])}, '
                        f'{c_string(row["layer"])}, {c_string(detail)}}},')
         out += ['};', '']
@@ -492,22 +510,118 @@ def getters_source(target, mapped, getters):
     return '\n'.join(out)
 
 
+def row_state(role, kind, selector, row, plugin_status):
+    if row['category'] != 'driver':
+        return 'inherited' if row['category'] == 'framework' else 'not-answered'
+    if 'plugin' not in role:
+        return 'no-plugin-class'
+    return plugin_status.get(role['name'], {}).get((kind, selector), 'loud')
+
+
 def surface_tsv(target, roles, plugin_status):
     lines = [HEADER.format(uuid=target.uuid).replace('//', '#').rstrip(),
              '# driver-class\tkind\tselector\tprotocols\tlayer\tclassification\tplugin-class\tplugin-status']
     for role in roles:
-        plugin = role.get('plugin', '-')
-        status = plugin_status.get(role['name'], {})
         for (kind, selector), row in sorted(role['rows'].items()):
-            if row['category'] != 'driver':
-                state = 'inherited' if row['category'] == 'framework' else 'not-answered'
-            elif plugin == '-':
-                state = 'no-plugin-class'
-            else:
-                state = status.get((kind, selector), 'loud')
             lines.append('\t'.join([role['name'], kind, selector, ','.join(row['protocols']) or '-', row['layer'],
-                                    row['category'], plugin, state]))
+                                    row['category'], role.get('plugin', '-'),
+                                    row_state(role, kind, selector, row, plugin_status)]))
     return '\n'.join(lines) + '\n'
+
+
+# System clients -------------------------------------------------------------------------------------------------------
+
+def note_key(kind, selector):
+    return ('+' if kind == 'class' else '') + selector
+
+
+class Notes:
+    """guest/SPI/notes.toml: why a driver selector is a LOUD stub, and why no plugin class serves a driver class."""
+
+    def __init__(self, text, roles, mapped):
+        data = tomllib.loads(text) if text is not None else {}
+        unknown = set(data) - {'loud', 'unserved'}
+        if unknown:
+            fail(f'{NOTES}: unknown tables {sorted(unknown)}')
+        self.loud = data.get('loud', {})
+        self.unserved = data.get('unserved', {})
+        names = {role['name']: role for role in roles}
+        plugins = {role['name'] for role in mapped}
+        for cls, table in sorted(self.loud.items()):
+            if cls not in plugins:
+                fail(f'{NOTES}: [loud.{cls}] names no driver class a plugin class stands in for')
+            for key in table:
+                kind = 'class' if key.startswith('+') else 'instance'
+                row = names[cls]['rows'].get((kind, key.lstrip('+')))
+                if not row or row['category'] != 'driver':
+                    fail(f'{NOTES}: [loud.{cls}] {key} is not a driver selector of {cls}')
+        for cls in sorted(self.unserved):
+            if cls not in names or cls in plugins:
+                fail(f'{NOTES}: [unserved] {cls} is not a Metal driver class without a plugin class')
+
+    def stub(self, cls, kind, selector):
+        return self.loud.get(cls, {}).get(note_key(kind, selector), '')
+
+
+def client_selectors(target, images):
+    """The selectors an image's __objc_selrefs reference: every message it sends, tests or sends to super."""
+    paths = target.cache.images()
+    out = set()
+    for path in images:
+        if path not in paths:
+            fail(f'{CLIENTS}: {path} is not an image of the 21H461 cache')
+        sections = target.cache.sections(paths[path])
+        for va, size in target.objc.section(sections, '__objc_selrefs'):
+            for at in range(va, va + size, 8):
+                pointer = target.cache.pointer(at)
+                if pointer:
+                    out.add(target.cache.cstring(pointer))
+    return out
+
+
+def client_rows(target, roles, client, plugin_status, reasons, notes):
+    """[(selector, driver class, kind, row, state, note, plugin class)] of one client, sorted by selector."""
+    selectors = client_selectors(target, client['images'])
+    out = []
+    for role in roles:
+        for (kind, selector), row in role['rows'].items():
+            if selector not in selectors or selector in LIFECYCLE:
+                continue
+            state = row_state(role, kind, selector, row, plugin_status)
+            if state == 'loud':
+                note = reasons.get((role['name'], kind, selector), notes.stub(role['name'], kind, selector))
+            elif state == 'no-plugin-class':
+                note = notes.unserved.get(role['name'], '')
+            else:
+                note = ''
+            out.append((selector, role['name'], kind, row, state, note, role.get('plugin', '-')))
+    return sorted(out, key=lambda r: (r[0], r[1], r[2]))
+
+
+def client_tsv(target, client, rows):
+    lines = [HEADER.format(uuid=target.uuid).replace('//', '#').rstrip(),
+             f'# The rows of surface.tsv whose selector {client["name"]} references ({", ".join(client["images"])}).',
+             '# selector\tdriver-class\tkind\tprotocols\tlayer\tclassification\tplugin-class\tplugin-status\tnote']
+    for selector, cls, kind, row, state, note, plugin in rows:
+        lines.append('\t'.join([selector, cls, kind, ','.join(row['protocols']) or '-', row['layer'], row['category'],
+                                plugin, state, note or '-']))
+    return '\n'.join(lines) + '\n'
+
+
+def check_notes(notes, mapped, plugin_status, reasons, clients, errors):
+    for name, rows in clients.items():
+        for selector, cls, kind, _, state, note, _ in rows:
+            if state in ('loud', 'no-plugin-class') and not note:
+                what = 'the driver class' if state == 'no-plugin-class' else 'the LOUD selector'
+                errors.append(f'{CLIENT_LISTS}/{name}.tsv: {what} {cls} {note_key(kind, selector)} has no note '
+                              f'in {NOTES}')
+    for role in mapped:
+        for key in notes.loud.get(role['name'], {}):
+            kind, selector = ('class', key[1:]) if key.startswith('+') else ('instance', key)
+            state = plugin_status.get(role['name'], {}).get((kind, selector), 'loud')
+            if state != 'loud' or (role['name'], kind, selector) in reasons:
+                errors.append(f'{NOTES}: [loud.{role["name"]}] {key}: {role["plugin"]} implements it '
+                              f'({"a LOUD method with its own detail" if state == "loud" else state})')
 
 
 # Built plugin ---------------------------------------------------------------------------------------------------------
@@ -521,7 +635,7 @@ class PluginImage:
         if magic != 0xfeedfacf or cputype != 0x0100000c:
             fail(f'{path} is not a thin arm64 Mach-O')
         self.data, self.segments, self.sections, self.platform = data, [], {}, None
-        fixups = None
+        fixups, self.symtab = None, None
         at = 32
         for _ in range(ncmds):
             cmd, size = struct.unpack_from('<II', data, at)
@@ -539,6 +653,8 @@ class PluginImage:
                 fixups = struct.unpack_from('<II', data, at + 8)
             elif cmd == 0x32:  # LC_BUILD_VERSION
                 self.platform, self.minos = struct.unpack_from('<II', data, at + 8)
+            elif cmd == 0x2:  # LC_SYMTAB: symoff, nsyms, stroff, strsize
+                self.symtab = struct.unpack_from('<4I', data, at + 8)
             at += size
         self.fixups = {}
         if fixups:
@@ -604,6 +720,7 @@ class PluginImage:
         return self.data[at:self.data.index(b'\0', at)].decode()
 
     def methods(self, va):
+        """(selector, type encoding, implementation address) of each method of a method list."""
         if not va:
             return []
         flags, count = struct.unpack_from('<II', self.data, self.offset(va))
@@ -611,12 +728,55 @@ class PluginImage:
         for i in range(count):
             if flags & 0x80000000:  # relative method list: selector reference, types, implementation offsets
                 entry = va + 8 + 12 * i
-                name, types, _ = struct.unpack_from('<3i', self.data, self.offset(entry))
-                out.append((self.cstring(self.pointer(entry + name)), self.cstring(entry + 4 + types)))
+                name, types, imp = struct.unpack_from('<3i', self.data, self.offset(entry))
+                out.append((self.cstring(self.pointer(entry + name)), self.cstring(entry + 4 + types), entry + 8 + imp))
             else:
                 entry = va + 8 + (flags & 0xfffc) * i
-                out.append((self.cstring(self.pointer(entry)), self.cstring(self.pointer(entry + 8))))
+                out.append((self.cstring(self.pointer(entry)), self.cstring(self.pointer(entry + 8)),
+                            self.pointer(entry + 16)))
         return out
+
+    def symbol(self, name):
+        """The address of a defined symbol of the image's symbol table (nlist_64), or None."""
+        if not self.symtab:
+            return None
+        symoff, nsyms, stroff, _ = self.symtab
+        for i in range(nsyms):
+            strx, ntype, _, _, value = struct.unpack_from('<IBBHQ', self.data, symoff + 16 * i)
+            if ntype & 0x0e == 0x0e and self.data[stroff + strx:self.data.index(b'\0', stroff + strx)] == name.encode():
+                return value
+        return None
+
+    def loud_method(self, imp, loud):
+        """Whether the arm64 code at imp calls `loud` (WMLoudMethod, which never returns) before any other call or any
+        branch, so that every call of the method fails; with the detail it passes (x2, built by adrp and add or by adr),
+        or '' when the code computes it otherwise. None for any other method."""
+        x2 = None
+        for k in range(256):
+            pc = imp + 4 * k
+            w, = struct.unpack_from('<I', self.data, self.offset(pc))
+            if w & 0xfc000000 == 0x94000000:  # BL
+                target = pc + 4 * (((w & 0x3ffffff) ^ 0x2000000) - 0x2000000)
+                if target != loud:
+                    return None
+                try:
+                    return self.cstring(x2) if x2 is not None else ''
+                except (ValueError, SystemExit):
+                    return ''
+            if (w & 0x7c000000 == 0x14000000 or w & 0xff000010 == 0x54000000 or w & 0x7e000000 in (0x34000000, 0x36000000)
+                    or w & 0xfe000000 == 0xd6000000):  # B, B.cond, CBZ/CBNZ, TBZ/TBNZ, BR/BLR/RET and their forms
+                return None
+            if w & 0x9f00001f == 0x90000002:  # ADRP x2
+                imm = ((w >> 29) & 3) | ((w >> 5) & 0x7ffff) << 2
+                x2 = (pc & ~0xfff) + (((imm ^ 0x100000) - 0x100000) << 12)
+            elif w & 0x9f00001f == 0x10000002:  # ADR x2
+                imm = ((w >> 29) & 3) | ((w >> 5) & 0x7ffff) << 2
+                x2 = pc + ((imm ^ 0x100000) - 0x100000)
+            elif w & 0xffc003ff == 0x91000042 and x2 is not None:  # ADD x2, x2, #imm12
+                x2 += (w >> 10) & 0xfff
+            elif w & 0x1f == 2:  # another instruction whose destination may be x2
+                x2 = None
+        return None
 
     def protocols(self, va):
         if not va:
@@ -658,10 +818,15 @@ class PluginImage:
         return out
 
 
-def audit_plugin(path, target, mapped, getters, errors):
+def audit_plugin(path, target, mapped, getters, errors, reasons):
+    """The status of each driver selector a plugin class implements: profile, implemented, or loud for a method that
+    fails every call (its detail goes to `reasons`, by driver class, kind and selector)."""
     image = PluginImage(path)
     if image.platform != 2:  # PLATFORM_IOS
         errors.append(f'{path}: platform {image.platform}, expected iOS (2)')
+    loud = image.symbol('_WMLoudMethod')
+    if loud is None:
+        errors.append(f'{path}: no symbol _WMLoudMethod (guest/Plugin/WebMetalReport.h) in its symbol table')
     classes = image.classes()
     statuses = {}
     for role in mapped:
@@ -679,7 +844,7 @@ def audit_plugin(path, target, mapped, getters, errors):
         status = statuses.setdefault(role['name'], {})
         for kind, field in (('instance', 'methods'), ('class', 'class_methods')):
             seen = set()
-            for selector, types in cls[field]:
+            for selector, types, imp in cls[field]:
                 if (kind, selector) in seen:
                     errors.append(f'{plugin}: {selector} is implemented twice')
                 seen.add((kind, selector))
@@ -699,7 +864,12 @@ def audit_plugin(path, target, mapped, getters, errors):
                     errors.append(f'{where}: type encoding {types}, 21H461 {row["owner"]} has {row["types"]}')
                 else:
                     profiled = role['name'] == PROFILED_CLASS and kind == 'instance' and selector in getters.methods
-                    status[(kind, selector)] = 'profile' if profiled else 'implemented'
+                    detail = image.loud_method(imp, loud) if loud is not None and not profiled else None
+                    if detail is not None:
+                        status[(kind, selector)] = 'loud'
+                        reasons[(role['name'], kind, selector)] = detail
+                    else:
+                        status[(kind, selector)] = 'profile' if profiled else 'implemented'
         if role['name'] == PROFILED_CLASS:
             for selector in getters.methods:
                 if status.get(('instance', selector)) != 'profile':
@@ -756,28 +926,41 @@ def main():
     device = by_name[PROFILED_CLASS]
     properties = {getter for protocol in device['protocols'] for getter in property_getters(target.protocols[protocol])}
     getters = ProfileGetters(profile_text, device, properties)
+    notes_path = webmetal / NOTES
+    notes = Notes(notes_path.read_text() if notes_path.exists() else None, roles, mapped)
+    clients = tomllib.loads((webmetal / CLIENTS).read_text()).get('client', []) if (webmetal / CLIENTS).exists() else []
 
     outputs = {
-        'WebMetalTargetSurface.h': surface_header(target, mapped, bases, getters),
+        'WebMetalTargetSurface.h': surface_header(target, mapped, bases, getters, notes),
         'WebMetalProfileGetters.mm': getters_source(target, mapped, getters),
     }
-    errors, statuses = [], {}
+    lists, client_lists = {}, {}
+    errors, statuses, reasons = [], {}, {}
     if args.plugin:
-        statuses = audit_plugin(args.plugin, target, mapped, getters, errors)
+        statuses = audit_plugin(args.plugin, target, mapped, getters, errors, reasons)
         outputs['surface.tsv'] = surface_tsv(target, roles, statuses)
+        for client in clients:
+            client_lists[client['name']] = client_rows(target, roles, client, statuses, reasons, notes)
+            lists[client['name'] + '.tsv'] = client_tsv(target, client, client_lists[client['name']])
+        check_notes(notes, mapped, statuses, reasons, client_lists, errors)
     elif args.check:
         fail('--check needs --plugin (the built iOS executable)')
 
-    directory = webmetal / GENERATED
-    if args.write:
-        directory.mkdir(parents=True, exist_ok=True)
-        for name, text in outputs.items():
-            (directory / name).write_text(text)
-    else:
-        for name, text in outputs.items():
-            path = directory / name
-            if not path.exists() or path.read_text() != text:
-                errors.append(f'{GENERATED}/{name} differs from a fresh derivation; run with --write')
+    for folder, files in ((GENERATED, outputs), (CLIENT_LISTS, lists)):
+        directory = webmetal / folder
+        if args.write:
+            directory.mkdir(parents=True, exist_ok=True)
+            for name, text in files.items():
+                (directory / name).write_text(text)
+        else:
+            for name, text in files.items():
+                path = directory / name
+                if not path.exists() or path.read_text() != text:
+                    errors.append(f'{folder}/{name} differs from a fresh derivation; run with --write')
+        if folder == CLIENT_LISTS and args.plugin and directory.exists():
+            for path in sorted(directory.glob('*.tsv')):
+                if path.name not in files:
+                    errors.append(f'{folder}/{path.name} is the list of no client {CLIENTS} names')
 
     for role in mapped:
         rows = role['rows']
@@ -785,7 +968,8 @@ def main():
         status = statuses.get(role['name'], {})
         implemented = sum(1 for s in status.values() if s == 'implemented')
         profiled = sum(1 for s in status.values() if s == 'profile')
-        loud = [key for key, row in sorted(rows.items()) if row['category'] == 'driver' and key not in status]
+        loud = [key for key, row in sorted(rows.items())
+                if row['category'] == 'driver' and status.get(key, 'loud') == 'loud']
         print(f'{role["plugin"]} for {" -> ".join(role["chain"])}: {count["driver"]} driver selectors '
               f'({implemented} implemented, {profiled} from the profile, {len(loud)} LOUD), {count["framework"]} '
               f'inherited from Metal.framework, {count["absent"]} absent')
@@ -797,14 +981,22 @@ def main():
           f'{sum(sum(1 for r in role["rows"].values() if r["category"] == "driver") for role in others)} '
           f'driver selectors of the other {len(others)} are not served by any plugin class yet')
     print(f'{len(getters.methods)} capability getters from the device profile; {len(bases)} base classes guarded')
+    for name, rows in client_lists.items():
+        states = {}
+        for row in rows:
+            state = row[4]
+            states[state] = states.get(state, 0) + 1
+        order = ('implemented', 'profile', 'inherited', 'not-answered', 'loud', 'no-plugin-class')
+        print(f'{name}: {len({r[0] for r in rows})} selectors, {len(rows)} driver-class rows: ' +
+              ', '.join(f'{states.get(state, 0)} {state}' for state in order))
     for selector in getters.skipped:
         print(f'not generated: {selector} (Metal.framework reports validation failures for some arguments)')
     for message in errors:
         print('error: ' + message)
     if errors:
         sys.exit(1)
-    print('PASS: ' + ('wrote ' + ', '.join(sorted(outputs)) if args.write else 'guest/Generated is current and the plugin '
-                      'matches the 21H461 surface'))
+    print('PASS: ' + ('wrote ' + ', '.join(sorted(outputs) + sorted(lists)) if args.write else
+                      'guest/Generated and guest/SPI/clients are current and the plugin matches the 21H461 surface'))
 
 
 main()
