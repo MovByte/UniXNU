@@ -16,14 +16,16 @@ Outputs, under --out (default build/web-metal-plugin):
                                the shim built with the 21H461 layouts the iOS bundle requires, to show that the guard
                                refuses this Mac's Metal.framework
   macos/WebMetalSPICheck       the checks of the system-client SPI (guest/SPI/host/WebMetalSPICheck.mm) on the shim
+  macos/WebMetalGuardCheck     the checks of the base-class guard (host/WebMetalGuardCheck.mm) on classes defined from
+                               the 21H461 layouts
   macos/WebMetalHostCheck      the host checks (host/WebMetalHostCheck.mm) and expectations.json, their reading of
                                the device profile
 
 Unless --no-check is given, the checks run: registration and the profile comparison twice, with the two sentinel
 values the device profile's extraction gives the kernel-supplied maxBufferLength; strict mode (WEBMETAL_STRICT=1) at
-the first LOUD stub; the refusal of the 21H461-layout shim; and the system-client SPI checks. --reference also builds
-the reference harness and runs it on the shim's device. The plugin's surface against the target is audited by
-audit-target-web-metal-surface.py --check --plugin <out>/ios/WebMetal.bundle/WebMetal.
+the first LOUD stub; the refusal of the 21H461-layout shim; the system-client SPI checks; and the guard checks.
+--reference also builds the reference harness and runs it on the shim's device. The plugin's surface against the
+target is audited by audit-target-web-metal-surface.py --check --plugin <out>/ios/WebMetal.bundle/WebMetal.
 """
 import argparse
 import json
@@ -110,8 +112,9 @@ def compile_macos():
     macos.mkdir(parents=True)
     host = ['xcrun', 'clang++', '-target', 'arm64-apple-macos14.0', '-isysroot', sdk('macosx'), *FLAGS]
     probe = macos / 'WebMetalLayoutProbe'
-    run([*host, guest / 'Plugin/host/WebMetalLayoutProbe.mm', '-framework', 'Foundation', '-framework', 'Metal',
-         '-o', probe])
+    # The probe looks selectors up as the guard does.
+    run([*host, guest / 'Plugin/host/WebMetalLayoutProbe.mm', guest / 'Plugin/WebMetalGuard.mm', '-framework',
+         'Foundation', '-framework', 'Metal', '-o', probe])
     layout = macos / 'WebMetalLayoutHost.mm'
     run([probe, layout])
     shim = guest / 'Plugin/host/WebMetalHostShim.mm'
@@ -125,6 +128,9 @@ def compile_macos():
     if (guest / 'SPI/host/WebMetalSPICheck.mm').exists():
         run([*host, guest / 'SPI/host/WebMetalSPICheck.mm', '-framework', 'Foundation', '-framework', 'Metal',
              '-o', macos / 'WebMetalSPICheck'])
+    if (guest / 'Plugin/host/WebMetalGuardCheck.mm').exists():
+        run([*host, guest / 'Plugin/host/WebMetalGuardCheck.mm', guest / 'Plugin/WebMetalGuard.mm', '-framework',
+             'Foundation', '-o', macos / 'WebMetalGuardCheck'])
     (macos / 'expectations.json').write_text(json.dumps(expectations(), indent=1) + '\n')
     print(f'built {macos}')
 
@@ -203,6 +209,8 @@ def check():
     run([tool, 'refuse', macos / 'libWebMetalHostShim-21H461.dylib'])
     if (macos / 'WebMetalSPICheck').exists():
         run([macos / 'WebMetalSPICheck', shim])
+    if (macos / 'WebMetalGuardCheck').exists():
+        run([macos / 'WebMetalGuardCheck'])
 
 
 def reference():

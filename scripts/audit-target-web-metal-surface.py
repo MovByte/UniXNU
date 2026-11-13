@@ -17,9 +17,12 @@ answer or its protocols declare, from the Objective-C metadata of the target's d
 
   WebMetalTargetSurface.h    the driver selectors (with type encodings and LOUD reasons) of each driver class a plugin
                              class stands in for (guest/Plugin/roles.toml), and the layout of the Metal.framework base
-                             classes guest/Private declares: superclass, instance size, instance variables, and every
-                             classified selector's presence and type encoding. The plugin refuses to load when the
-                             running Metal.framework differs. A driver class whose chain reaches the root class
+                             classes guest/Private declares: superclass, instance size (class_ro_t's instanceSize,
+                             which the guard rounds up to a word as class_getInstanceSize does), instance variables,
+                             and every classified selector's presence and type encoding in the method lists
+                             Metal.framework gives the class and its Metal.framework superclasses (what the root class
+                             answers is not the framework's). The plugin refuses to load when the running
+                             Metal.framework differs. A driver class whose chain reaches the root class
                              without a Metal.framework base (AGXTextureLayout -> IOGPUMetalTextureLayout -> NSObject)
                              has NSObject as its base, which has no layout to guard.
   WebMetalProfileGetters.mm  the capability getters of the A10X: every driver selector the device profile
