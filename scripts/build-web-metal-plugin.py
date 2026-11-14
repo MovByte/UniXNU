@@ -5,9 +5,14 @@ Outputs, under --out (default build/web-metal-plugin):
 
   ios/AGXMetalA10.bundle       the plugin for iPadOS 17.7 (arm64-apple-ios17.7), ad-hoc signed with 4 KiB pages, with
                                the names of the A10X driver bundle it replaces: its Info.plist (in binary form, as
-                               Apple's) and its classes are AGXMetalA10's. It is installed as
-                               /System/Library/Extensions/AGXMetalA10.bundle and loaded by Metal.framework for the
-                               WebMetal accelerator service
+                               Apple's) and its classes are AGXMetalA10's. Its executable is WebMetal, which its
+                               Info.plist's CFBundleExecutable names: the 21H461 shared cache holds the driver's own
+                               executable path, AGXMetalA10.bundle/AGXMetalA10, and dyld loads a path the cache holds
+                               from the cache. It is signed with the driver bundle's resource rules
+                               (guest/Plugin/ResourceRules.plist), which seal nothing outside Resources/, so its
+                               CodeResources is the driver bundle's. It is installed in
+                               /System/Library/Extensions/AGXMetalA10.bundle, merged with the driver bundle's resources
+                               there, and loaded by Metal.framework for the WebMetal accelerator service
   macos/libWebMetalHostShim.dylib
                                the macOS test shim: the same classes, built against this Mac's Metal.framework layouts
                                (recorded by host/WebMetalLayoutProbe.mm), registering a device with MTLAddDevice and
@@ -27,7 +32,7 @@ Unless --no-check is given, the checks run: registration and the profile compari
 values the device profile's extraction gives the kernel-supplied maxBufferLength; strict mode (WEBMETAL_STRICT=1) at
 the first LOUD stub; the refusal of the 21H461-layout shim; the system-client SPI checks; and the guard checks.
 --reference also builds the reference harness and runs it on the shim's device. The plugin's surface against the
-target is audited by audit-target-web-metal-surface.py --check --plugin <out>/ios/AGXMetalA10.bundle/AGXMetalA10.
+target is audited by audit-target-web-metal-surface.py --check --plugin <out>/ios/AGXMetalA10.bundle/WebMetal.
 """
 import argparse
 import json
@@ -83,26 +88,29 @@ def compile_ios():
     bundle = out / 'ios/AGXMetalA10.bundle'
     shutil.rmtree(bundle, ignore_errors=True)
     bundle.mkdir(parents=True)
-    executable = bundle / 'AGXMetalA10'
+    executable = bundle / 'WebMetal'
     # The deployment target is the driver's: AGXMetalA10's LC_BUILD_VERSION and its Info.plist's MinimumOSVersion are
     # 17.7.
     run(['xcrun', 'clang++', '-target', 'arm64-apple-ios17.7', '-isysroot', sdk('iphoneos'), *FLAGS, '-bundle',
          *PLUGIN, guest / 'Plugin/WebMetalLayoutTarget.mm', *GENERATED, *FRAMEWORKS, '-o', executable])
     # The debug symbols stay beside the bundle, out of its signed contents.
-    symbols = out / 'ios/AGXMetalA10.dSYM'
+    symbols = out / 'ios/WebMetal.dSYM'
     shutil.rmtree(symbols, ignore_errors=True)
-    if (bundle / 'AGXMetalA10.dSYM').exists():
-        shutil.move(bundle / 'AGXMetalA10.dSYM', symbols)
+    if (bundle / 'WebMetal.dSYM').exists():
+        shutil.move(bundle / 'WebMetal.dSYM', symbols)
     shutil.copyfile(guest / 'Plugin/Info.plist', bundle / 'Info.plist')
     run(['plutil', '-convert', 'binary1', bundle / 'Info.plist'])
     info = plistlib.loads((bundle / 'Info.plist').read_bytes())
     if info['CFBundleExecutable'] != executable.name or info['NSPrincipalClass'] != 'AGXPrincipalDevice':
-        sys.exit('FAIL: guest/Plugin/Info.plist does not name the AGXMetalA10 executable and AGXPrincipalDevice')
+        sys.exit('FAIL: guest/Plugin/Info.plist does not name the WebMetal executable and AGXPrincipalDevice')
     header = executable.read_bytes()[:16]
     if header[:8] != bytes.fromhex('cffaedfe0c000001') or int.from_bytes(header[8:12], 'little') & 0xffffff != 0:
         sys.exit('FAIL: the bundle executable is not an arm64 Mach-O')
-    run(['codesign', '--force', '--sign', '-', '--pagesize', '4096', '--identifier', info['CFBundleIdentifier'], bundle])
-    run(['codesign', '--verify', '--strict', bundle])
+    # The driver bundle's resource rules are custom omit rules, which this Mac's codesign takes with a deprecation
+    # warning and its strict verification refuses as an obsolete resource envelope; the bundle is verified without it.
+    run(['codesign', '--force', '--sign', '-', '--pagesize', '4096', '--identifier', info['CFBundleIdentifier'],
+         '--resource-rules', guest / 'Plugin/ResourceRules.plist', bundle])
+    run(['codesign', '--verify', '--no-strict', bundle])
     detail = subprocess.run(['codesign', '--display', '--verbose=4', bundle], capture_output=True, text=True,
                             check=True).stderr
     if not re.search(r'^Page size=4096$', detail, re.M):

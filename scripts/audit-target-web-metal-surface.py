@@ -62,7 +62,11 @@ named after an AGXMetalA10 class has that class's superclass and implements only
 and no other class of the plugin takes a 21H461 class name or the AGX prefix. It fails when a loud or unserved row of a
 client list has no note, or when notes.toml has a note for a selector the plugin implements or for a class the plugin
 defines. Categories in the three images join their classes (IOGPU.framework adds one to _MTLSharedEvent); categories
-other images add are not read, and the device profile records that none adds one to the device chain.
+other images add are not read, and the device profile records that none adds one to the device chain. The bundle's
+Info.plist is the driver bundle's, in binary form, with one difference: CFBundleExecutable names the plugin's
+executable, WebMetal, in place of AGXMetalA10, the path of which the shared cache holds. Its
+_CodeSignature/CodeResources is the driver bundle's, byte for byte (the bundle is signed with the driver's resource
+rules).
 """
 import argparse
 import plistlib
@@ -84,11 +88,11 @@ CLIENT_LISTS = 'guest/SPI/clients'
 # The root class: the base of a driver class with no Metal.framework class in its chain.
 ROOT_CLASS = 'NSObject'
 DRIVER_IMAGES = ('AGX', 'IOGPU')
-# The driver bundle the plugin replaces, and the keys of its Info.plist that record how Apple built it (build machine,
-# compiler, SDK, platform and Xcode): the plugin's bundle, built by another toolchain, carries none of them.
+# The driver bundle the plugin replaces, and the one difference of the plugin bundle's Info.plist from its: the
+# executable's name. The 21H461 shared cache holds DRIVER_BUNDLE/AGXMetalA10, and dyld loads a path the cache holds from
+# the cache, so the plugin's executable has a name of its own, which CFBundleExecutable gives.
 DRIVER_BUNDLE = 'System/Library/Extensions/AGXMetalA10.bundle'
-BUILD_KEYS = {'BuildMachineOSBuild', 'DTCompiler', 'DTPlatformBuild', 'DTPlatformName', 'DTPlatformVersion',
-              'DTSDKBuild', 'DTSDKName', 'DTXcode', 'DTXcodeBuild'}
+EXECUTABLE = 'WebMetal'
 # Runtime-generated and lifecycle selectors: every class has its own, they are no part of the Metal surface.
 LIFECYCLE = {'.cxx_construct', '.cxx_destruct', 'dealloc', 'init', 'initialize', 'load'}
 # The profile describes AGXA10XDevice, the device class the A10X's accelerator names in MetalPluginClassName.
@@ -97,7 +101,7 @@ PROFILED_CLASS = 'AGXA10XDevice'
 parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 parser.add_argument('--root', type=Path, required=True, help='unpacked 21H461 root file system (only read)')
 parser.add_argument('--webmetal', type=Path, default=ROOT / 'drivers/WebMetal', help='WebMetal checkout')
-parser.add_argument('--plugin', type=Path, help='built iOS executable (AGXMetalA10.bundle/AGXMetalA10) to audit')
+parser.add_argument('--plugin', type=Path, help='built iOS executable (AGXMetalA10.bundle/WebMetal) to audit')
 mode = parser.add_mutually_exclusive_group(required=True)
 mode.add_argument('--write', action='store_true', help='write guest/Generated')
 mode.add_argument('--check', action='store_true', help='compare guest/Generated to a fresh derivation and audit --plugin')
@@ -1008,26 +1012,40 @@ def audit_names(path, target, mapped, classes, errors):
 
 
 def audit_info(path, classes, errors):
-    """The plugin bundle's Info.plist: every key the driver bundle's has, with its value, but those that record how
-    Apple built it, and a principal class the plugin defines."""
-    ours = path.parent / 'Info.plist'
+    """The plugin bundle's Info.plist and resource seal: the driver bundle's Info.plist, in binary form, every key with
+    its value but CFBundleExecutable, which names the plugin's executable (EXECUTABLE) in place of the driver's; the
+    driver bundle's _CodeSignature/CodeResources; and a principal class the plugin defines."""
+    bundle = path.parent
+    driver = args.root.resolve() / DRIVER_BUNDLE
+    ours = bundle / 'Info.plist'
     if not ours.exists():
-        errors.append(f'{path.parent} has no Info.plist')
+        errors.append(f'{bundle} has no Info.plist')
         return
-    info = plistlib.loads(ours.read_bytes())
-    real = plistlib.loads((args.root.resolve() / DRIVER_BUNDLE / 'Info.plist').read_bytes())
+    raw = ours.read_bytes()
+    if not raw.startswith(b'bplist00'):
+        errors.append(f'{ours}: not in binary form, as 21H461\'s is')
+    info = plistlib.loads(raw)
+    real = plistlib.loads((driver / 'Info.plist').read_bytes())
     for key in sorted(set(info) | set(real)):
-        if key in BUILD_KEYS:
-            if key in info:
-                errors.append(f'{ours}: {key} records Apple\'s build of {DRIVER_BUNDLE}, not this one')
-        elif key not in info:
+        if key not in info:
             errors.append(f'{ours}: no {key}; 21H461\'s is {real[key]!r}')
         elif key not in real:
             errors.append(f'{ours}: {key}, which 21H461\'s Info.plist does not have')
+        elif key == 'CFBundleExecutable':
+            if info[key] != EXECUTABLE or real[key] == EXECUTABLE:
+                errors.append(f'{ours}: CFBundleExecutable is {info[key]!r}, expected {EXECUTABLE!r} in place of '
+                              f'21H461\'s {real[key]!r}')
         elif info[key] != real[key]:
             errors.append(f'{ours}: {key} is {info[key]!r}, 21H461\'s is {real[key]!r}')
-    if info.get('CFBundleExecutable') != path.name:
-        errors.append(f'{ours}: CFBundleExecutable {info.get("CFBundleExecutable")!r}, the executable is {path.name}')
+    if path.name != EXECUTABLE:
+        errors.append(f'{path}: the executable is not {EXECUTABLE}, which the bundle\'s Info.plist names')
+    driver_executable = real.get('CFBundleExecutable')
+    if driver_executable and (bundle / driver_executable).exists():
+        errors.append(f'{bundle}: holds {driver_executable}, the driver executable\'s name, which dyld loads from the '
+                      'shared cache')
+    seal = bundle / '_CodeSignature/CodeResources'
+    if not seal.exists() or seal.read_bytes() != (driver / '_CodeSignature/CodeResources').read_bytes():
+        errors.append(f'{seal}: not the CodeResources of 21H461\'s {DRIVER_BUNDLE}')
     if info.get('NSPrincipalClass') not in classes:
         errors.append(f'{ours}: the principal class {info.get("NSPrincipalClass")!r} is not a class of {path}')
 
