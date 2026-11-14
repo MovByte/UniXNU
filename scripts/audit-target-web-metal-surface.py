@@ -1,35 +1,45 @@
 #!/usr/bin/env python3
 """Derive WebMetal's guest plugin surface from the user's own 21H461 root and audit the built plugin against it.
 
-The guest plugin (drivers/WebMetal/guest) replaces the A10X's Metal driver bundle. For every Metal object class of
-that driver (the AGXMetalA10 classes that adopt an MTL protocol) this script classifies every selector its objects
-answer or its protocols declare, from the Objective-C metadata of the target's dyld shared cache (read-only):
+The guest plugin (drivers/WebMetal/guest) replaces the A10X's Metal driver bundle, AGXMetalA10, and defines its
+classes under the driver's own names (guest/Plugin/roles.toml). For every Metal object class of that driver (the
+AGXMetalA10 classes that adopt an MTL protocol) this script classifies every selector its objects answer or its
+protocols declare, from the Objective-C metadata of the target's dyld shared cache (read-only):
 
   driver     the method is implemented by the driver layers the plugin replaces (AGXMetalA10, IOGPU.framework).
-             The plugin class standing in for that driver class implements it, or it is a LOUD stub: reported as not
-             implemented and failed, never answered.
+             The plugin's class of the same name implements it, or it is a LOUD stub: reported as not implemented and
+             failed, never answered.
   framework  a protocol method the driver class inherits from its Metal.framework base (_MTLDevice, _MTLResource...).
-             The plugin class subclasses the same base and inherits the same code; it must not override it.
+             The plugin's class subclasses the same base and inherits the same code; it must not override it.
   absent     a protocol method no class of the chain implements (respondsToSelector: is NO on the device). The plugin
              must not implement it either.
 
+The plugin's classes keep the driver's superclass chain inside the bundle (AGXA10XDevice -> AGXA10FamilyDevice,
+AGXA10FamilyBuffer -> AGXBuffer, AGXA10FamilyTexture -> AGXTexture); where the driver's chain continues through
+IOGPU.framework (AGXA10FamilyDevice -> IOGPUMetalDevice -> _MTLDevice), the plugin's topmost class subclasses the
+Metal.framework base directly, since IOGPU.framework's classes are the system's own. A driver selector is carried, as
+an implementation or a LOUD stub, by the class that defines it on 21H461, or, for one IOGPU.framework defines, by the
+topmost class.
+
 --write regenerates guest/Generated and guest/SPI/clients in the WebMetal checkout:
 
-  WebMetalTargetSurface.h    the driver selectors (with type encodings and LOUD reasons) of each driver class a plugin
-                             class stands in for (guest/Plugin/roles.toml), and the layout of the Metal.framework base
-                             classes guest/Private declares: superclass, instance size (class_ro_t's instanceSize,
-                             which the guard rounds up to a word as class_getInstanceSize does), instance variables,
-                             and every classified selector's presence and type encoding in the method lists
-                             Metal.framework gives the class and its Metal.framework superclasses (what the root class
-                             answers is not the framework's). The plugin refuses to load when the running
-                             Metal.framework differs. A driver class whose chain reaches the root class
-                             without a Metal.framework base (AGXTextureLayout -> IOGPUMetalTextureLayout -> NSObject)
-                             has NSObject as its base, which has no layout to guard.
+  WebMetalTargetSurface.h    for each class the plugin defines (guest/Plugin/roles.toml), its superclass and base and
+                             the driver selectors it carries (with type encodings, the 21H461 class defining each and
+                             LOUD reasons), and the layout of the Metal.framework base classes guest/Private declares:
+                             superclass, instance size (class_ro_t's instanceSize, which the guard rounds up to a word
+                             as class_getInstanceSize does), instance variables, and every classified selector's
+                             presence and type encoding in the method lists Metal.framework gives the class and its
+                             Metal.framework superclasses (what the root class answers is not the framework's). The
+                             plugin refuses to load when the running Metal.framework differs. A driver class whose
+                             chain reaches the root class without a Metal.framework base (AGXTextureLayout ->
+                             IOGPUMetalTextureLayout -> NSObject) has NSObject as its base, which has no layout to
+                             guard.
   WebMetalProfileGetters.mm  the capability getters of the A10X: every driver selector the device profile
-                             (profile/ipados-17.7.11-21H461-a10x.toml) answers with a value.
+                             (profile/ipados-17.7.11-21H461-a10x.toml) answers with a value, on the device class that
+                             carries it.
   surface.tsv                the classification of every selector of every driver class, with its status in the built
-                             plugin: implemented, profile or loud for a driver selector of a class the plugin stands in
-                             for (no-plugin-class otherwise), inherited for a framework one, not-answered for an absent
+                             plugin: implemented, profile or loud for a driver selector of a class the plugin defines
+                             (no-plugin-class otherwise), inherited for a framework one, not-answered for an absent
                              one. It needs --plugin, the built iOS executable; the loud rows are the backlog. A
                              plugin method whose code calls WMLoudMethod before any other call or branch fails every
                              call: it is loud, not implemented.
@@ -37,22 +47,25 @@ answer or its protocols declare, from the Objective-C metadata of the target's d
                              of surface.tsv whose selector the client's images reference (__objc_selrefs: every
                              selector they send, test with respondsToSelector: or send to super), with a note for each
                              loud row (the reason a hand-written LOUD method reports, or guest/SPI/notes.toml's) and
-                             for each row of a driver class no plugin class stands in for (notes.toml's, per class). A
+                             for each row of a driver class the plugin does not define (notes.toml's, per class). A
                              selector reference proves the client can send the message, not to which receiver, so
                              every driver class with the selector has a row. It needs --plugin.
 
-guest/SPI/notes.toml holds the notes: [loud.<driver class>] gives, for a selector the plugin answers with a generated
+guest/SPI/notes.toml holds the notes: [loud.<class>] gives, for a selector a class of the plugin carries as a generated
 LOUD stub, what is unknown or what the host cannot do exactly (the stub reports it, through WebMetalTargetSurface.h);
-[unserved] gives, for a driver class no plugin class stands in for, why the plugin hands out no object of it.
+[unserved] gives, for a driver class the plugin does not define, why the plugin hands out no object of it.
 
---check regenerates in memory, fails if a committed file differs, and audits the built plugin: each plugin class has
-the driver class's base and protocols, implements only driver selectors, with the target's type encodings, and every
-other driver selector is a LOUD stub. It fails when a loud or unserved row of a client list has no note, or when
-notes.toml has a note for a selector the plugin implements or for a class a plugin class stands in for. Categories in
-the three images join their classes (IOGPU.framework adds one to _MTLSharedEvent); categories other images add are not
-read, and the device profile records that none adds one to the device chain.
+--check regenerates in memory, fails if a committed file differs, and audits the built plugin: each of its classes has
+the driver class's superclass chain inside the bundle, base and protocols, implements only the driver selectors it
+carries, with the target's type encodings, and every other driver selector it carries is a LOUD stub; any other class
+named after an AGXMetalA10 class has that class's superclass and implements only selectors the class itself carries,
+and no other class of the plugin takes a 21H461 class name or the AGX prefix. It fails when a loud or unserved row of a
+client list has no note, or when notes.toml has a note for a selector the plugin implements or for a class the plugin
+defines. Categories in the three images join their classes (IOGPU.framework adds one to _MTLSharedEvent); categories
+other images add are not read, and the device profile records that none adds one to the device chain.
 """
 import argparse
+import plistlib
 import re
 import struct
 import sys
@@ -71,15 +84,20 @@ CLIENT_LISTS = 'guest/SPI/clients'
 # The root class: the base of a driver class with no Metal.framework class in its chain.
 ROOT_CLASS = 'NSObject'
 DRIVER_IMAGES = ('AGX', 'IOGPU')
+# The driver bundle the plugin replaces, and the keys of its Info.plist that record how Apple built it (build machine,
+# compiler, SDK, platform and Xcode): the plugin's bundle, built by another toolchain, carries none of them.
+DRIVER_BUNDLE = 'System/Library/Extensions/AGXMetalA10.bundle'
+BUILD_KEYS = {'BuildMachineOSBuild', 'DTCompiler', 'DTPlatformBuild', 'DTPlatformName', 'DTPlatformVersion',
+              'DTSDKBuild', 'DTSDKName', 'DTXcode', 'DTXcodeBuild'}
 # Runtime-generated and lifecycle selectors: every class has its own, they are no part of the Metal surface.
 LIFECYCLE = {'.cxx_construct', '.cxx_destruct', 'dealloc', 'init', 'initialize', 'load'}
-# The profile describes AGXA10XDevice, the device class AGXPrincipalDevice creates for the A10X.
+# The profile describes AGXA10XDevice, the device class the A10X's accelerator names in MetalPluginClassName.
 PROFILED_CLASS = 'AGXA10XDevice'
 
 parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 parser.add_argument('--root', type=Path, required=True, help='unpacked 21H461 root file system (only read)')
 parser.add_argument('--webmetal', type=Path, default=ROOT / 'drivers/WebMetal', help='WebMetal checkout')
-parser.add_argument('--plugin', type=Path, help='built iOS executable (WebMetal.bundle/WebMetal) to audit')
+parser.add_argument('--plugin', type=Path, help='built iOS executable (AGXMetalA10.bundle/AGXMetalA10) to audit')
 mode = parser.add_mutually_exclusive_group(required=True)
 mode.add_argument('--write', action='store_true', help='write guest/Generated')
 mode.add_argument('--check', action='store_true', help='compare guest/Generated to a fresh derivation and audit --plugin')
@@ -226,8 +244,11 @@ class Target:
                 rows[key] = {'category': 'absent', 'owner': None, 'layer': 'none', 'types': types}
         for key, row in rows.items():
             row['protocols'] = sorted(declared.get(key, ()))
+        bundle = [link['name'] for link in chain if link['image'] == 'AGX']
+        if bundle != [link['name'] for link in chain[:len(bundle)]]:
+            fail(f'{name}: the AGXMetalA10 classes of its chain are not its first links')
         return {'name': name, 'chain': [link['name'] for link in chain], 'base': base, 'protocols': protocols,
-                'rows': rows}
+                'rows': rows, 'bundle': bundle}
 
     def roles(self):
         out = []
@@ -252,6 +273,26 @@ class Target:
                         present.setdefault((kind, selector), types)
         return {'name': name, 'super': cls['super'], 'size': cls['instance_size'], 'ivars': cls['ivars'],
                 'selectors': [(kind, sel, present.get((kind, sel))) for kind, sel in sorted(selectors)]}
+
+
+# Classes of the plugin ------------------------------------------------------------------------------------------------
+
+def superclass_of(role):
+    """The superclass of the plugin's class of a driver class: the next AGXMetalA10 class of the driver's chain, or the
+    base where the driver's chain leaves the bundle (through IOGPU.framework, or straight to Metal.framework)."""
+    return role['bundle'][1] if len(role['bundle']) > 1 else role['base']
+
+
+def carrier(role, row):
+    """The plugin class that carries a driver selector of a role: the AGXMetalA10 class defining it on 21H461, or the
+    topmost AGXMetalA10 class of the chain for a selector IOGPU.framework defines."""
+    return row['owner'] if row['owner'] in role['bundle'] else role['bundle'][-1]
+
+
+def carried(role):
+    """{(kind, selector): row} of the driver selectors the plugin's class of `role` carries itself."""
+    return {key: row for key, row in role['rows'].items()
+            if row['category'] == 'driver' and carrier(role, row) == role['name']}
 
 
 # Device profile -------------------------------------------------------------------------------------------------------
@@ -440,21 +481,26 @@ def surface_header(target, mapped, bases, getters, notes):
     out = [HEADER.format(uuid=target.uuid), '#pragma once', '', '#include "../Plugin/WebMetalSurface.h"', '',
            'namespace webmetal::target {', '',
            f'inline constexpr char kCacheUUID[] = {c_string(target.uuid)};', '']
+    device = profiled_role(mapped)
     for role in mapped:
-        rows = [(k, s, r) for (k, s), r in sorted(role['rows'].items()) if r['category'] == 'driver']
-        out.append(f'// Driver-layer selectors of {" -> ".join(role["chain"])}.')
+        rows = sorted(carried(role).items())
+        out.append(f'// Driver-layer selectors {role["name"]} carries ({" -> ".join(role["chain"])}).')
         out.append(f'inline constexpr DriverSelector k{c_name(role["name"])}Driver[] = {{')
-        for kind, selector, row in rows:
-            detail = getters.reasons.get(selector, '') if role['name'] == PROFILED_CLASS and kind == 'instance' else ''
+        for (kind, selector), row in rows:
+            profiled = role['name'] in device['bundle'] and kind == 'instance'
+            detail = getters.reasons.get(selector, '') if profiled else ''
             detail = '; '.join(d for d in (detail, notes.stub(role['name'], kind, selector)) if d)
             out.append(f'    {{SelectorKind::{kind.capitalize()}, {c_string(selector)}, {c_string(row["types"])}, '
-                       f'{c_string(row["layer"])}, {c_string(detail)}}},')
+                       f'{c_string(row["owner"])}, {c_string(detail)}}},')
+        if not rows:
+            out.append('    {SelectorKind::Instance, nullptr, nullptr, nullptr, nullptr},  '
+                       '// none; the count below is 0')
         out += ['};', '']
+    out.append('// The AGXMetalA10 classes the plugin defines, each over its superclass in the bundle or its base.')
     out.append('inline constexpr Role kRoles[] = {')
     for role in mapped:
-        n = sum(1 for r in role['rows'].values() if r['category'] == 'driver')
-        out.append(f'    {{{c_string(role["plugin"])}, {c_string(role["name"])}, {c_string(role["base"])}, '
-                   f'k{c_name(role["name"])}Driver, {n}}},')
+        out.append(f'    {{{c_string(role["name"])}, {c_string(superclass_of(role))}, {c_string(role["base"])}, '
+                   f'k{c_name(role["name"])}Driver, {len(carried(role))}}},')
     out += ['};', '']
     for base in bases:
         out.append(f'inline constexpr BaseIvar k{c_name(base["name"])}Ivars[] = {{')
@@ -480,11 +526,13 @@ def surface_header(target, mapped, bases, getters, notes):
 
 
 def getters_source(target, mapped, getters):
-    devices = [role['plugin'] for role in mapped if role['name'] == PROFILED_CLASS]
+    device = profiled_role(mapped)
     out = [HEADER.format(uuid=target.uuid).rstrip(), '// Capability getters of the A10X: the driver selectors whose answer the device profile',
-           f'// ({PROFILE}) records. The comment above each method is the profile\'s provenance.', '',
+           f'// ({PROFILE}) records, on the device class that carries each. The comment above each method is the',
+           '// profile\'s provenance.', '',
            '#import "../Plugin/WebMetalDevice.h"', '#import "../Plugin/WebMetalReport.h"', '',
-           '// The class adopts the protocols that declare these methods; this category, not the class, implements them.',
+           '// The classes adopt the protocols that declare these methods; these categories, not the classes, implement',
+           '// them.',
            '#pragma clang diagnostic ignored "-Wobjc-protocol-method-implementation"', '']
     structs = {}
     for (kind, selector), row in sorted(getters.rows.items()):
@@ -503,9 +551,14 @@ def getters_source(target, mapped, getters):
                 'template <typename T> static T WMBits(unsigned long long bits)', '{',
                 '    T value;', '    static_assert(sizeof value <= sizeof bits, "bit-field structure wider than its value");',
                 '    memcpy(&value, &bits, sizeof value);', '    return value;', '}', '']
-    for plugin in devices:
-        out += [f'@implementation {plugin} (WebMetalProfile)', '']
-        for selector in sorted(getters.methods):
+    by_class = {}
+    for selector in sorted(getters.methods):
+        by_class.setdefault(carrier(device, device['rows'][('instance', selector)]), []).append(selector)
+    for cls in device['bundle']:
+        if cls not in by_class:
+            continue
+        out += [f'@implementation {cls} (WebMetalProfile)', '']
+        for selector in by_class[cls]:
             source, provenance = getters.methods[selector]
             out += ['// ' + line for line in textwrap.wrap(provenance, 117)]
             out.append(source)
@@ -513,12 +566,21 @@ def getters_source(target, mapped, getters):
     return '\n'.join(out)
 
 
+def profiled_role(mapped):
+    for role in mapped:
+        if role['name'] == PROFILED_CLASS:
+            return role
+    fail(f'{ROLES} does not list {PROFILED_CLASS}, the class the device profile describes')
+
+
 def row_state(role, kind, selector, row, plugin_status):
+    """A row's status in the built plugin; `plugin_status` holds, by plugin class, the status of each driver selector
+    the class carries that it implements itself."""
     if row['category'] != 'driver':
         return 'inherited' if row['category'] == 'framework' else 'not-answered'
     if 'plugin' not in role:
         return 'no-plugin-class'
-    return plugin_status.get(role['name'], {}).get((kind, selector), 'loud')
+    return plugin_status.get(carrier(role, row), {}).get((kind, selector), 'loud')
 
 
 def surface_tsv(target, roles, plugin_status):
@@ -539,7 +601,8 @@ def note_key(kind, selector):
 
 
 class Notes:
-    """guest/SPI/notes.toml: why a driver selector is a LOUD stub, and why no plugin class serves a driver class."""
+    """guest/SPI/notes.toml: why a selector a plugin class carries is a LOUD stub, and why the plugin does not define a
+    driver class."""
 
     def __init__(self, text, roles, mapped):
         data = tomllib.loads(text) if text is not None else {}
@@ -548,19 +611,19 @@ class Notes:
             fail(f'{NOTES}: unknown tables {sorted(unknown)}')
         self.loud = data.get('loud', {})
         self.unserved = data.get('unserved', {})
-        names = {role['name']: role for role in roles}
-        plugins = {role['name'] for role in mapped}
+        names = {role['name'] for role in roles}
+        plugins = {role['name']: role for role in mapped}
         for cls, table in sorted(self.loud.items()):
             if cls not in plugins:
-                fail(f'{NOTES}: [loud.{cls}] names no driver class a plugin class stands in for')
+                fail(f'{NOTES}: [loud.{cls}] names no class the plugin defines')
+            own = carried(plugins[cls])
             for key in table:
                 kind = 'class' if key.startswith('+') else 'instance'
-                row = names[cls]['rows'].get((kind, key.lstrip('+')))
-                if not row or row['category'] != 'driver':
-                    fail(f'{NOTES}: [loud.{cls}] {key} is not a driver selector of {cls}')
+                if (kind, key.lstrip('+')) not in own:
+                    fail(f'{NOTES}: [loud.{cls}] {key} is not a driver selector {cls} carries')
         for cls in sorted(self.unserved):
             if cls not in names or cls in plugins:
-                fail(f'{NOTES}: [unserved] {cls} is not a Metal driver class without a plugin class')
+                fail(f'{NOTES}: [unserved] {cls} is not a Metal driver class the plugin does not define')
 
     def stub(self, cls, kind, selector):
         return self.loud.get(cls, {}).get(note_key(kind, selector), '')
@@ -592,7 +655,8 @@ def client_rows(target, roles, client, plugin_status, reasons, notes):
                 continue
             state = row_state(role, kind, selector, row, plugin_status)
             if state == 'loud':
-                note = reasons.get((role['name'], kind, selector), notes.stub(role['name'], kind, selector))
+                owner = carrier(role, row)
+                note = reasons.get((owner, kind, selector), notes.stub(owner, kind, selector))
             elif state == 'no-plugin-class':
                 note = notes.unserved.get(role['name'], '')
             else:
@@ -623,7 +687,7 @@ def check_notes(notes, mapped, plugin_status, reasons, clients, errors):
             kind, selector = ('class', key[1:]) if key.startswith('+') else ('instance', key)
             state = plugin_status.get(role['name'], {}).get((kind, selector), 'loud')
             if state != 'loud' or (role['name'], kind, selector) in reasons:
-                errors.append(f'{NOTES}: [loud.{role["name"]}] {key}: {role["plugin"]} implements it '
+                errors.append(f'{NOTES}: [loud.{role["name"]}] {key}: the plugin implements it '
                               f'({"a LOUD method with its own detail" if state == "loud" else state})')
 
 
@@ -839,8 +903,8 @@ class PluginImage:
 
 
 def audit_plugin(path, target, mapped, getters, errors, reasons):
-    """The status of each driver selector a plugin class implements: profile, implemented, or loud for a method that
-    fails every call (its detail goes to `reasons`, by driver class, kind and selector)."""
+    """The status of each driver selector a plugin class implements itself: profile, implemented, or loud for a method
+    that fails every call (its detail goes to `reasons`, by plugin class, kind and selector)."""
     image = PluginImage(path)
     if image.platform != 2:  # PLATFORM_IOS
         errors.append(f'{path}: platform {image.platform}, expected iOS (2)')
@@ -848,53 +912,124 @@ def audit_plugin(path, target, mapped, getters, errors, reasons):
     if loud is None:
         errors.append(f'{path}: no symbol _WMLoudMethod (guest/Plugin/WebMetalReport.h) in its symbol table')
     classes = image.classes()
+    device = profiled_role(mapped)
     statuses = {}
     for role in mapped:
-        plugin = role['plugin']
-        cls = classes.get(plugin)
+        name = role['name']
+        cls = classes.get(name)
         if not cls:
-            errors.append(f'{plugin} (for {role["name"]}) is not in {path}')
+            errors.append(f'{name} is not in {path}')
             continue
-        if cls['super'] != role['base']:
-            errors.append(f'{plugin}: superclass {cls["super"]}, the 21H461 driver class {role["name"]} is a {role["base"]}')
-        mtl = {p for p in target.closure(cls['protocols']) if p.startswith('MTL')}
+        if cls['super'] != superclass_of(role):
+            errors.append(f'{name}: superclass {cls["super"]}, expected {superclass_of(role)} '
+                          f'({" -> ".join(role["chain"])} on 21H461)')
+        adopted = set()
+        for link in role['bundle']:
+            adopted |= set(classes.get(link, {}).get('protocols', ()))
+        for link in role['chain']:
+            if target.classes[link]['image'] == 'Metal':
+                adopted |= set(target.classes[link]['protocols'])
+        mtl = {p for p in target.closure(adopted) if p.startswith('MTL')}
         want = {p for p in role['protocols'] if p.startswith('MTL')}
         if mtl != want:
-            errors.append(f'{plugin}: adopts {sorted(mtl)}, {role["name"]} adopts {sorted(want)}')
-        status = statuses.setdefault(role['name'], {})
+            errors.append(f'{name} and its superclasses adopt {sorted(mtl)}, 21H461 {name} adopts {sorted(want)}')
+        own = carried(role)
+        status = statuses.setdefault(name, {})
         for kind, field in (('instance', 'methods'), ('class', 'class_methods')):
             seen = set()
             for selector, types, imp in cls[field]:
                 if (kind, selector) in seen:
-                    errors.append(f'{plugin}: {selector} is implemented twice')
+                    errors.append(f'{name}: {selector} is implemented twice')
                 seen.add((kind, selector))
                 if selector in LIFECYCLE:
                     continue
                 row = role['rows'].get((kind, selector))
-                where = f'{"+" if kind == "class" else "-"}[{plugin} {selector}]'
+                where = f'{"+" if kind == "class" else "-"}[{name} {selector}]'
                 if not row:
-                    errors.append(f'{where}: neither the 21H461 driver layers of {role["name"]} implement it nor does a '
+                    errors.append(f'{where}: neither the 21H461 driver layers of {name} implement it nor does a '
                                   'protocol it adopts declare it')
                 elif row['category'] == 'framework':
-                    errors.append(f'{where}: {role["name"]} inherits it from {row["owner"]} (Metal.framework); '
+                    errors.append(f'{where}: {name} inherits it from {row["owner"]} (Metal.framework); '
                                   'the plugin must inherit it too')
                 elif row['category'] == 'absent':
                     errors.append(f'{where}: no layer of the 21H461 driver implements it (respondsToSelector: is NO)')
+                elif (kind, selector) not in own:
+                    errors.append(f'{where}: 21H461 {row["owner"]} defines it, so the plugin\'s '
+                                  f'{carrier(role, row)} carries it')
                 elif types != row['types']:
                     errors.append(f'{where}: type encoding {types}, 21H461 {row["owner"]} has {row["types"]}')
                 else:
-                    profiled = role['name'] == PROFILED_CLASS and kind == 'instance' and selector in getters.methods
+                    profiled = name in device['bundle'] and kind == 'instance' and selector in getters.methods
                     detail = image.loud_method(imp, loud) if loud is not None and not profiled else None
                     if detail is not None:
                         status[(kind, selector)] = 'loud'
-                        reasons[(role['name'], kind, selector)] = detail
+                        reasons[(name, kind, selector)] = detail
                     else:
                         status[(kind, selector)] = 'profile' if profiled else 'implemented'
-        if role['name'] == PROFILED_CLASS:
-            for selector in getters.methods:
-                if status.get(('instance', selector)) != 'profile':
-                    errors.append(f'-[{plugin} {selector}]: the generated profile getter is missing from {path}')
+    for selector in getters.methods:
+        owner = carrier(device, device['rows'][('instance', selector)])
+        if statuses.get(owner, {}).get(('instance', selector)) != 'profile':
+            errors.append(f'-[{owner} {selector}]: the generated profile getter is missing from {path}')
+    audit_names(path, target, mapped, classes, errors)
+    audit_info(path, classes, errors)
     return statuses
+
+
+def audit_names(path, target, mapped, classes, errors):
+    """The plugin's other classes: one named after an AGXMetalA10 class has that class's superclass and implements only
+    selectors it carries; no other takes a name of the 21H461 driver stack or the AGX prefix."""
+    names = {role['name'] for role in mapped}
+    for name, cls in sorted(classes.items()):
+        if name in names:
+            continue
+        real = target.classes.get(name)
+        if real is None:
+            if name.startswith('AGX'):
+                errors.append(f'{name}: the AGX prefix is the driver\'s, and AGXMetalA10 has no class {name}')
+            continue
+        if real['image'] != 'AGX':
+            errors.append(f'{name} is a class of {real["image"]} on 21H461, which the system defines')
+            continue
+        role = target.role(name)
+        if cls['super'] != superclass_of(role):
+            errors.append(f'{name}: superclass {cls["super"]}, expected {superclass_of(role)} '
+                          f'({" -> ".join(role["chain"])} on 21H461)')
+        own = carried(role)
+        for kind, field in (('instance', 'methods'), ('class', 'class_methods')):
+            for selector, types, _ in cls[field]:
+                if selector in LIFECYCLE:
+                    continue
+                row = own.get((kind, selector))
+                where = f'{"+" if kind == "class" else "-"}[{name} {selector}]'
+                if not row:
+                    errors.append(f'{where}: 21H461 {name} does not carry it')
+                elif types != row['types']:
+                    errors.append(f'{where}: type encoding {types}, 21H461 {row["owner"]} has {row["types"]}')
+
+
+def audit_info(path, classes, errors):
+    """The plugin bundle's Info.plist: every key the driver bundle's has, with its value, but those that record how
+    Apple built it, and a principal class the plugin defines."""
+    ours = path.parent / 'Info.plist'
+    if not ours.exists():
+        errors.append(f'{path.parent} has no Info.plist')
+        return
+    info = plistlib.loads(ours.read_bytes())
+    real = plistlib.loads((args.root.resolve() / DRIVER_BUNDLE / 'Info.plist').read_bytes())
+    for key in sorted(set(info) | set(real)):
+        if key in BUILD_KEYS:
+            if key in info:
+                errors.append(f'{ours}: {key} records Apple\'s build of {DRIVER_BUNDLE}, not this one')
+        elif key not in info:
+            errors.append(f'{ours}: no {key}; 21H461\'s is {real[key]!r}')
+        elif key not in real:
+            errors.append(f'{ours}: {key}, which 21H461\'s Info.plist does not have')
+        elif info[key] != real[key]:
+            errors.append(f'{ours}: {key} is {info[key]!r}, 21H461\'s is {real[key]!r}')
+    if info.get('CFBundleExecutable') != path.name:
+        errors.append(f'{ours}: CFBundleExecutable {info.get("CFBundleExecutable")!r}, the executable is {path.name}')
+    if info.get('NSPrincipalClass') not in classes:
+        errors.append(f'{ours}: the principal class {info.get("NSPrincipalClass")!r} is not a class of {path}')
 
 
 # Main -----------------------------------------------------------------------------------------------------------------
@@ -923,11 +1058,16 @@ def main():
     mapping = tomllib.loads((webmetal / ROLES).read_text()).get('class', [])
     mapped = []
     for entry in mapping:
-        role = by_name.get(entry['target'])
+        role = by_name.get(entry['name'])
         if not role:
-            fail(f'{ROLES}: {entry["target"]} is not a Metal driver class of AGXMetalA10 on 21H461')
+            fail(f'{ROLES}: {entry["name"]} is not a Metal driver class of AGXMetalA10 on 21H461')
         role['plugin'] = entry['name']
         mapped.append(role)
+    for role in mapped:
+        for link in role['bundle'][1:]:
+            if 'plugin' not in by_name.get(link, {}):
+                fail(f'{ROLES}: {role["name"]}\'s 21H461 superclass {link} is an AGXMetalA10 class the list does '
+                     'not name')
     declared = private_bases((webmetal / PRIVATE).read_text())
     for name, superclass in sorted(declared.items()):
         if name not in target.classes:
@@ -985,21 +1125,20 @@ def main():
     for role in mapped:
         rows = role['rows']
         count = {c: sum(1 for r in rows.values() if r['category'] == c) for c in ('driver', 'framework', 'absent')}
-        status = statuses.get(role['name'], {})
+        status = {key: row_state(role, *key, row, statuses) for key, row in rows.items() if row['category'] == 'driver'}
         implemented = sum(1 for s in status.values() if s == 'implemented')
         profiled = sum(1 for s in status.values() if s == 'profile')
-        loud = [key for key, row in sorted(rows.items())
-                if row['category'] == 'driver' and status.get(key, 'loud') == 'loud']
-        print(f'{role["plugin"]} for {" -> ".join(role["chain"])}: {count["driver"]} driver selectors '
+        loud = [key for key in sorted(status) if status[key] == 'loud']
+        print(f'{role["name"]} ({" -> ".join(role["chain"])}): {count["driver"]} driver selectors '
               f'({implemented} implemented, {profiled} from the profile, {len(loud)} LOUD), {count["framework"]} '
               f'inherited from Metal.framework, {count["absent"]} absent')
         if args.backlog:
             for kind, selector in loud:
                 print(f'    LOUD {"+" if kind == "class" else "-"}{selector}')
     others = [role for role in roles if 'plugin' not in role]
-    print(f'{len(roles)} Metal driver classes on 21H461; {len(mapped)} with a plugin class; '
+    print(f'{len(roles)} Metal driver classes on 21H461; the plugin defines {len(mapped)}; '
           f'{sum(sum(1 for r in role["rows"].values() if r["category"] == "driver") for role in others)} '
-          f'driver selectors of the other {len(others)} are not served by any plugin class yet')
+          f'driver selectors of the other {len(others)} are not served yet')
     print(f'{len(getters.methods)} capability getters from the device profile; {len(bases)} base classes guarded')
     for name, rows in client_lists.items():
         states = {}

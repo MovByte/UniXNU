@@ -3,9 +3,11 @@
 
 Outputs, under --out (default build/web-metal-plugin):
 
-  ios/WebMetal.bundle          the plugin for iPadOS 17 (arm64-apple-ios17.0), ad-hoc signed with 4 KiB pages; it is
-                               installed as /System/Library/Extensions/WebMetal.bundle and loaded by Metal.framework
-                               for the WebMetal accelerator service
+  ios/AGXMetalA10.bundle       the plugin for iPadOS 17.7 (arm64-apple-ios17.7), ad-hoc signed with 4 KiB pages, with
+                               the names of the A10X driver bundle it replaces: its Info.plist (in binary form, as
+                               Apple's) and its classes are AGXMetalA10's. It is installed as
+                               /System/Library/Extensions/AGXMetalA10.bundle and loaded by Metal.framework for the
+                               WebMetal accelerator service
   macos/libWebMetalHostShim.dylib
                                the macOS test shim: the same classes, built against this Mac's Metal.framework layouts
                                (recorded by host/WebMetalLayoutProbe.mm), registering a device with MTLAddDevice and
@@ -25,7 +27,7 @@ Unless --no-check is given, the checks run: registration and the profile compari
 values the device profile's extraction gives the kernel-supplied maxBufferLength; strict mode (WEBMETAL_STRICT=1) at
 the first LOUD stub; the refusal of the 21H461-layout shim; the system-client SPI checks; and the guard checks.
 --reference also builds the reference harness and runs it on the shim's device. The plugin's surface against the
-target is audited by audit-target-web-metal-surface.py --check --plugin <out>/ios/WebMetal.bundle/WebMetal.
+target is audited by audit-target-web-metal-surface.py --check --plugin <out>/ios/AGXMetalA10.bundle/AGXMetalA10.
 """
 import argparse
 import json
@@ -78,21 +80,24 @@ def sdk(name):
 
 
 def compile_ios():
-    bundle = out / 'ios/WebMetal.bundle'
+    bundle = out / 'ios/AGXMetalA10.bundle'
     shutil.rmtree(bundle, ignore_errors=True)
     bundle.mkdir(parents=True)
-    executable = bundle / 'WebMetal'
-    run(['xcrun', 'clang++', '-target', 'arm64-apple-ios17.0', '-isysroot', sdk('iphoneos'), *FLAGS, '-bundle',
+    executable = bundle / 'AGXMetalA10'
+    # The deployment target is the driver's: AGXMetalA10's LC_BUILD_VERSION and its Info.plist's MinimumOSVersion are
+    # 17.7.
+    run(['xcrun', 'clang++', '-target', 'arm64-apple-ios17.7', '-isysroot', sdk('iphoneos'), *FLAGS, '-bundle',
          *PLUGIN, guest / 'Plugin/WebMetalLayoutTarget.mm', *GENERATED, *FRAMEWORKS, '-o', executable])
     # The debug symbols stay beside the bundle, out of its signed contents.
-    symbols = out / 'ios/WebMetal.dSYM'
+    symbols = out / 'ios/AGXMetalA10.dSYM'
     shutil.rmtree(symbols, ignore_errors=True)
-    if (bundle / 'WebMetal.dSYM').exists():
-        shutil.move(bundle / 'WebMetal.dSYM', symbols)
+    if (bundle / 'AGXMetalA10.dSYM').exists():
+        shutil.move(bundle / 'AGXMetalA10.dSYM', symbols)
     shutil.copyfile(guest / 'Plugin/Info.plist', bundle / 'Info.plist')
+    run(['plutil', '-convert', 'binary1', bundle / 'Info.plist'])
     info = plistlib.loads((bundle / 'Info.plist').read_bytes())
-    if info['CFBundleExecutable'] != executable.name or info['NSPrincipalClass'] != 'WebMetalDevice':
-        sys.exit('FAIL: guest/Plugin/Info.plist does not name the WebMetal executable and WebMetalDevice')
+    if info['CFBundleExecutable'] != executable.name or info['NSPrincipalClass'] != 'AGXPrincipalDevice':
+        sys.exit('FAIL: guest/Plugin/Info.plist does not name the AGXMetalA10 executable and AGXPrincipalDevice')
     header = executable.read_bytes()[:16]
     if header[:8] != bytes.fromhex('cffaedfe0c000001') or int.from_bytes(header[8:12], 'little') & 0xffffff != 0:
         sys.exit('FAIL: the bundle executable is not an arm64 Mach-O')
@@ -202,7 +207,7 @@ def check():
         run([tool, 'register', shim, macos / 'expectations.json', hex(sentinel)])
     strict = subprocess.run([tool, 'strict', shim], capture_output=True, text=True,
                             env={'WEBMETAL_STRICT': '1', 'PATH': '/usr/bin:/bin'})
-    line = 'WebMetal: -[WebMetalDevice newAccelerationStructureWithSize:]: not implemented'
+    line = 'WebMetal: -[AGXA10XDevice newAccelerationStructureWithSize:]: not implemented'
     if strict.returncode != -signal.SIGABRT or line not in strict.stderr or 'WEBMETAL_STRICT' not in strict.stderr:
         sys.exit(f'FAIL: strict mode did not abort at the first LOUD stub (status {strict.returncode}):\n{strict.stdout}{strict.stderr}')
     print(f'PASS: under WEBMETAL_STRICT=1 the first LOUD stub reports and aborts: {line}')
